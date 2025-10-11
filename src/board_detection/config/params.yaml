@@ -1,0 +1,5 @@
+mvs_camera_display_node:
+  ros__parameters:
+    exposure_time: 1000.0    # 曝光时间（单位 μs）
+    frame_rate: 25.0          # 帧率（单位 FPS）
+    gain: 8.0                 # 增益（单位 dB）
