@@ -199,20 +199,21 @@ public:
     {
             cv::Mat high_ori, high, gray, high1, last_frame, last_high1,high_ada;
             cv::cvtColor(frame,gray,cv::COLOR_BGR2GRAY);
-            cv::threshold(gray,high_ori,150,255,cv::THRESH_BINARY);
+            cv::threshold(gray,high_ori,100,255,cv::THRESH_BINARY);
             cv::adaptiveThreshold(gray,high_ada,255,cv::ADAPTIVE_THRESH_MEAN_C,cv::THRESH_BINARY,51,0);
             //cv::threshold(gray,high,0,255,cv::THRESH_BINARY | cv::THRESH_OTSU);
             //cv::imshow("high_ori",high_ori);
             //cv::imshow("high_ada",high_ada);
 
             cv::bitwise_and(high_ori, high_ada, high);
-            cv::Mat kernel1 = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(21, 21));
+            cv::Mat kernel1 = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
             cv::Mat kernel2 = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
             
-            cv::medianBlur(high,high,7);
+            cv::medianBlur(high,high,3);
             cv::erode(high, high1, kernel1);
             cv::dilate(high1, high1, kernel1); 
-            
+            //high1 = high.clone();
+
             cv::Mat channels[3];
             cv::split(frame, channels);         // 三通道分离
 
@@ -229,7 +230,7 @@ public:
             // cv::Mat hsv,high_blue;
             // cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
             // cv::inRange(hsv,cv::Scalar(100,43,46),cv::Scalar(124,255,255),high_blue);
-            // cv::imshow("BLUE",high_blue);
+            cv::imshow("BLUE",high_blue);
             cv::bitwise_and(high1, high_blue, high1);
 
 
@@ -255,7 +256,7 @@ public:
                 float rbbox_height = max(rbbox[i].size.width, rbbox[i].size.height);
                 float rbbox_width = min(rbbox[i].size.width, rbbox[i].size.height);
                 float hw_ratio = rbbox_height/rbbox_width;
-                if(hw_ratio > 2.5 && hw_ratio < 7){
+                if(hw_ratio > 2.5){
                     rbbox_f.push_back(rbbox[i]);
                 }
             }
@@ -264,14 +265,97 @@ public:
             vector<cv::Rect> board;
             int board_num = 0;
             for(int i = 0;i<rbbox_f.size();i++){
+                //cout << i << "的角度" << rbbox_f[i].angle << endl;
                 lightbox.push_back(rbbox_f[i].boundingRect());
                 //rectangle(frame, lightbox[i], cv::Scalar(255,0,0), 2);
             }
 
+
+            //打算加一段灯条配对的逻辑，也就是两个旋转矩形的旋转角度差在一定范围内
             for(int i = 1;i<lightbox.size();i++){
                 board.push_back(lightbox[i] | lightbox[i-1]);
-                rectangle(frame, board[i-1], cv::Scalar(0,0,255), 2);
+                //rectangle(frame, board[i-1], cv::Scalar(0,0,255), 2);
             }
+
+            cv::Point2f center;
+            for(int i = 0;i<board.size();i++){
+                cv::circle(frame,center,2,cv::Scalar(0,0,255),-1);
+                center = cv::Point(board[i].x + board[i].width/2.0,board[i].y + board[i].height/2.0);
+            }
+
+            if(rbbox_f.size()==2){
+                cv::RotatedRect box1,box2;
+                box1 = rbbox_f[0];
+                box2 = rbbox_f[1];
+                double angle;
+                if(abs(box1.angle - box2.angle) > 45){
+                    angle = abs((box1.angle + box2.angle)/2.0 - abs(box1.angle - box2.angle)/2.0);
+                }
+                else{
+                    angle = (box1.angle + box2.angle)/2.0;
+                }
+                cv::Point2f p1 = rbbox_f[0].center;
+                cv::Point2f p2 = rbbox_f[1].center;
+                cv::Vec2f diff(p1.x - p2.x, p1.y - p2.y);
+                double d = cv::norm(diff);
+                cv::RotatedRect boarddetected(center, cv::Size(d,d),angle);
+                cv::Point2f ver1[4];                
+                boarddetected.points(ver1);
+                for(int j = 0;j<4;j++){
+                    cv::line(frame,ver1[j],ver1[(j+1)%4],cv::Scalar(0,0,255),3);
+                }  
+
+                double height = (max(box1.size.width, box1.size.height)+max(box2.size.width, box2.size.height))/2.0;
+                cv::RotatedRect Rotated_light_box = (angle > 45 ) ? cv::RotatedRect(center, cv::Size(height,d),angle) : cv::RotatedRect(center, cv::Size(d,height),angle);
+                cv::Point2f ver2[4];
+                Rotated_light_box.points(ver2);
+                for(int j = 0;j<4;j++){
+                    cv::line(frame,ver2[j],ver2[(j+1)%4],cv::Scalar(0,255,0),3);
+                }
+                
+                cv::Point2f jpoint[4];
+                Rotated_light_box.points(jpoint); //从左上角开始，顺时针提取
+                // for(int j = 0;j<4;j++){
+                //     cout << jpoint[j] << endl;
+                // }
+                // cout << "//" << endl;
+                //cout << angle << endl;
+                double w = 135;
+                double h = 56;
+
+                vector<cv::Point3f> armor_3D = {
+                    {-w/2,  h/2, 0},   // 左上
+                    { w/2,  h/2, 0},  // 右上
+                    { w/2, -h/2, 0},  // 右下
+                    {-w/2, -h/2, 0},  // 左下
+                };
+
+                cv::Mat cameraMatrix = (cv::Mat_<double>(3,3) <<
+                    4621, 0, 771,
+                    0, 4622, 636,
+                    0, 0, 1);
+                cv::Mat distCoeffs = (cv::Mat_<double>(1,5) << -0.065, 0.7247, 0, 0, 0);
+
+                std::vector<cv::Point2f> imagePoints(jpoint, jpoint + 4);
+
+                cv::Mat rvec, tvec;
+                cv::solvePnP(
+                    armor_3D,
+                    imagePoints,
+                    cameraMatrix,
+                    distCoeffs,
+                    rvec,
+                    tvec,
+                    false,
+                    cv::SOLVEPNP_IPPE_SQUARE   // 针对平面矩形目标最优
+                );
+
+                cout << "tvec = \n" << tvec << endl;
+
+
+                
+            }
+     
 
             // vector<cv::Rect> board_f;
             // for(int i = 0;i<board.size();i++){
@@ -284,12 +368,12 @@ public:
 
             //cout << board_num << endl;
             
-            //frame.copyTo(last_frame);
+            frame.copyTo(last_frame);
             //high1.copyTo(last_high1);
 
         //}
 
-        //cv::imshow("origin",last_frame);
+        cv::imshow("origin",last_frame);
         //cv::imshow("gray",last_high1);
     }
 

@@ -1,0 +1,12 @@
+{
+    "cmake.sourceDirectory": "/home/zngyim/Desktop/XJTU-RMV-Task06/src/board_detection",
+    "files.associations": {
+        "vector": "cpp",
+        "iosfwd": "cpp",
+        "iterator": "cpp",
+        "deque": "cpp",
+        "string": "cpp",
+        "__split_buffer": "cpp",
+        "list": "cpp"
+    }
+}
