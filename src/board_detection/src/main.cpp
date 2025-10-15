@@ -8,7 +8,32 @@
 #include <thread>
 #include <atomic>
 
+#include <torch/script.h>
+#include <torch/torch.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+
+
 using namespace std;
+
+static cv::Mat extractRotatedROI(const cv::Mat& src, const cv::RotatedRect& rect) {
+    cv::Mat M = (rect.angle < 45) ? cv::getRotationMatrix2D(rect.center, rect.angle, 1.0) : cv::getRotationMatrix2D(rect.center, rect.angle - 90, 1.0);
+    cv::Mat rotated;
+    cv::warpAffine(src, rotated, M, src.size(), cv::INTER_CUBIC);
+    cv::Mat roi;
+    cv::getRectSubPix(rotated, rect.size, rect.center, roi);
+    return roi;
+}
+
+static cv::Mat to28x28GrayFloat(const cv::Mat& src) {
+    cv::Mat gray, resized, f32;
+    if (src.channels() == 3) cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    else gray = src;
+    cv::resize(gray, resized, cv::Size(28, 28));
+    resized.convertTo(f32, CV_32F, 1.0/255.0);
+    return f32; // H×W, 单通道，float32
+}
 
 class BOARDdetection : public rclcpp::Node
 {
@@ -19,7 +44,7 @@ public:
 
         // 创建 ROS2 发布器
         
-        this->declare_parameter<double>("exposure_time", 1000.0);
+        this->declare_parameter<double>("exposure_time", 4000.0);
         this->declare_parameter<double>("frame_rate", 30.0);
         this->declare_parameter<double>("gain", 10.0);
         this->declare_parameter<std::string>("pixel_format", "BGR8");
@@ -83,7 +108,54 @@ public:
                 rate.sleep();
             }
         });
+            // ====== 数字识别：加载模型 + 启动识别线程（异步） ======
+        try {
+            torch_device_ = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
+            // 模型路径：按需调整
+            const std::string model_path = "model/model.pt";
+            digit_module_ = std::make_unique<torch::jit::script::Module>(torch::jit::load(model_path, torch_device_));
+            digit_module_->eval();
+            RCLCPP_INFO(this->get_logger(), "Digit model loaded on %s", (torch_device_.is_cuda() ? "CUDA" : "CPU"));
+        } catch (const c10::Error& e) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to load TorchScript model: %s", e.msg().c_str());
+        }
+        
+        // 后台识别线程：从队列取 ROI → 预处理 → 推理
+        digit_thread_ = std::thread([this] {
+            torch::NoGradGuard nograd;
+            while (rclcpp::ok() && !digit_stop_) {
+                cv::Mat roi;
+                {
+                    std::unique_lock<std::mutex> lk(roi_mtx_);
+                    roi_cv_.wait(lk, [&]{ return !roi_queue_.empty() || digit_stop_; });
+                    if (digit_stop_) break;
+                    roi = roi_queue_.front();
+                    roi_queue_.pop();
+                }
+                if (roi.empty()) continue;
+        
+                // 预处理：H×W float32 单通道
+                cv::Mat f32 = to28x28GrayFloat(roi);
+                f32 = (f32 - 0.5f) / 0.5f; 
+        
+                // NCHW: 1×1×28×28
+                auto input = torch::from_blob(
+                    f32.data, {1, 1, 28, 28},
+                    torch::TensorOptions().dtype(torch::kFloat32)
+                ).clone().to(torch_device_); // clone 防止与 OpenCV 同一内存的生命周期问题
+        
+                try {
+                    auto out = digit_module_->forward({input}).toTensor();
+                    int pred = out.argmax(1).item<int>() ; // 标签是 1~5
+                    RCLCPP_INFO(this->get_logger(), "[digit] predict = %d", pred);
+                } catch (const std::exception& e) {
+                    RCLCPP_WARN(this->get_logger(), "digit inference failed: %s", e.what());
+                }
+            }
+        });
     }
+
+
 
     ~BOARDdetection()
     {
@@ -99,6 +171,11 @@ public:
         reconnect_thread_.join();
         
         MV_CC_Finalize();
+
+        digit_stop_ = true;
+        roi_cv_.notify_all();
+        if (digit_thread_.joinable()) digit_thread_.join();
+
     }
     
     private:
@@ -194,12 +271,20 @@ public:
         }
     }
 
+    float angle_change(float &angle){
+        if(angle > 90){
+            angle = angle -180.0;
+        }
+        return angle;
+    }
+
     //------------------装甲板识别--------------------
     void detection(cv::Mat &frame)
     {
             cv::Mat high_ori, high, gray, high1, last_frame, last_high1,high_ada;
+            cv::Mat num_roi = frame.clone();//为了数字识别做准备
             cv::cvtColor(frame,gray,cv::COLOR_BGR2GRAY);
-            cv::threshold(gray,high_ori,100,255,cv::THRESH_BINARY);
+            cv::threshold(gray,high_ori,150,255,cv::THRESH_BINARY);
             cv::adaptiveThreshold(gray,high_ada,255,cv::ADAPTIVE_THRESH_MEAN_C,cv::THRESH_BINARY,51,0);
             //cv::threshold(gray,high,0,255,cv::THRESH_BINARY | cv::THRESH_OTSU);
             //cv::imshow("high_ori",high_ori);
@@ -213,6 +298,7 @@ public:
             cv::erode(high, high1, kernel1);
             cv::dilate(high1, high1, kernel1); 
             //high1 = high.clone();
+            cv::imshow("gray",high1);
 
             cv::Mat channels[3];
             cv::split(frame, channels);         // 三通道分离
@@ -283,10 +369,14 @@ public:
                 center = cv::Point(board[i].x + board[i].width/2.0,board[i].y + board[i].height/2.0);
             }
 
+            double box1_angle, box2_angle;
+            
             if(rbbox_f.size()==2){
                 cv::RotatedRect box1,box2;
                 box1 = rbbox_f[0];
                 box2 = rbbox_f[1];
+                // box1_angle = angle_change(box1.angle);
+                // box2_angle = angle_change(box2.angle);
                 double angle;
                 if(abs(box1.angle - box2.angle) > 45){
                     angle = abs((box1.angle + box2.angle)/2.0 - abs(box1.angle - box2.angle)/2.0);
@@ -294,17 +384,18 @@ public:
                 else{
                     angle = (box1.angle + box2.angle)/2.0;
                 }
+                //angle = (box1_angle + box2_angle)/2.0;
                 cv::Point2f p1 = rbbox_f[0].center;
                 cv::Point2f p2 = rbbox_f[1].center;
                 cv::Vec2f diff(p1.x - p2.x, p1.y - p2.y);
                 double d = cv::norm(diff);
-                cv::RotatedRect boarddetected(center, cv::Size(d,d),angle);
+                cv::RotatedRect boarddetected(center, cv::Size(d*0.85,d*0.85),angle);
                 cv::Point2f ver1[4];                
                 boarddetected.points(ver1);
                 for(int j = 0;j<4;j++){
                     cv::line(frame,ver1[j],ver1[(j+1)%4],cv::Scalar(0,0,255),3);
                 }  
-
+                
                 double height = (max(box1.size.width, box1.size.height)+max(box2.size.width, box2.size.height))/2.0;
                 cv::RotatedRect Rotated_light_box = (angle > 45 ) ? cv::RotatedRect(center, cv::Size(height,d),angle) : cv::RotatedRect(center, cv::Size(d,height),angle);
                 cv::Point2f ver2[4];
@@ -313,45 +404,62 @@ public:
                     cv::line(frame,ver2[j],ver2[(j+1)%4],cv::Scalar(0,255,0),3);
                 }
                 
+                // === 把 ROI 送进识别线程（非阻塞） ===
+                try {
+                    cv::Mat roi = extractRotatedROI(frame, Rotated_light_box);
+                    if (!roi.empty() && roi.cols >= 12 && roi.rows >= 12) {
+                        std::lock_guard<std::mutex> lk(roi_mtx_);
+                        // 防止队列无限增长：限制一下排队量
+                        if (roi_queue_.size() < 5) {
+                            roi_queue_.push(roi.clone());
+                            roi_cv_.notify_one();
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    RCLCPP_WARN(this->get_logger(), "extractRotatedROI failed: %s", e.what());
+                }
+
+
                 cv::Point2f jpoint[4];
                 Rotated_light_box.points(jpoint); //从左上角开始，顺时针提取
                 // for(int j = 0;j<4;j++){
-                //     cout << jpoint[j] << endl;
-                // }
-                // cout << "//" << endl;
-                //cout << angle << endl;
-                double w = 135;
-                double h = 56;
-
-                vector<cv::Point3f> armor_3D = {
-                    {-w/2,  h/2, 0},   // 左上
-                    { w/2,  h/2, 0},  // 右上
-                    { w/2, -h/2, 0},  // 右下
-                    {-w/2, -h/2, 0},  // 左下
-                };
-
-                cv::Mat cameraMatrix = (cv::Mat_<double>(3,3) <<
+                    //     cout << jpoint[j] << endl;
+                    // }
+                    // cout << "//" << endl;
+                    //cout << angle << endl;
+                    double w = 135;
+                    double h = 56;
+                    
+                    vector<cv::Point3f> armor_3D = {
+                        {-w/2,  h/2, 0},   // 左上
+                        { w/2,  h/2, 0},  // 右上
+                        { w/2, -h/2, 0},  // 右下
+                        {-w/2, -h/2, 0},  // 左下
+                    };
+                    
+                    cv::Mat cameraMatrix = (cv::Mat_<double>(3,3) <<
                     4621, 0, 771,
                     0, 4622, 636,
                     0, 0, 1);
-                cv::Mat distCoeffs = (cv::Mat_<double>(1,5) << -0.065, 0.7247, 0, 0, 0);
-
-                std::vector<cv::Point2f> imagePoints(jpoint, jpoint + 4);
-
-                cv::Mat rvec, tvec;
-                cv::solvePnP(
-                    armor_3D,
-                    imagePoints,
-                    cameraMatrix,
-                    distCoeffs,
-                    rvec,
-                    tvec,
-                    false,
-                    cv::SOLVEPNP_IPPE_SQUARE   // 针对平面矩形目标最优
-                );
-
-                cout << "tvec = \n" << tvec << endl;
-
+                    cv::Mat distCoeffs = (cv::Mat_<double>(1,5) << -0.065, 0.7247, 0, 0, 0);
+                    
+                    std::vector<cv::Point2f> imagePoints(jpoint, jpoint + 4);
+                    
+                    cv::Mat rvec, tvec;
+                    cv::solvePnP(
+                        armor_3D,
+                        imagePoints,
+                        cameraMatrix,
+                        distCoeffs,
+                        rvec,
+                        tvec,
+                        false,
+                        cv::SOLVEPNP_IPPE_SQUARE   // 针对平面矩形目标最优
+                    );
+                    
+                    //cout << "tvec = \n" << tvec << endl;
+                    
+                    imshow("ROI",to28x28GrayFloat(extractRotatedROI(num_roi,boarddetected)));
 
                 
             }
@@ -471,6 +579,16 @@ public:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr fps_pub_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+    
+    // --- 数字识别（异步线程） ---
+    std::unique_ptr<torch::jit::script::Module> digit_module_;
+    std::thread digit_thread_;
+    std::queue<cv::Mat> roi_queue_;
+    std::mutex roi_mtx_;
+    std::condition_variable roi_cv_;
+    std::atomic<bool> digit_stop_{false};
+    torch::Device torch_device_ = torch::kCPU;
+
 };
 
 int main(int argc, char** argv)
